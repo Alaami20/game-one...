@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Dodge!</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin:0; height:100%; background:#111; color:#eee; font-family:system-ui, Arial, sans-serif; }
+    #ui { position:fixed; top:10px; left:50%; transform:translateX(-50%); text-align:center; user-select:none; }
+    .btn { background:#222; border:1px solid #444; padding:6px 10px; border-radius:8px; cursor:pointer; }
+    canvas { display:block; margin:0 auto; background:#0b0f13; outline:1px solid #222; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <span id="score">Score: 0</span>
+    <button id="restart" class="btn" style="margin-left:12px;">Restart (R)</button>
+  </div>
+  <canvas id="game" width="480" height="720"></canvas>
+
+  <script>
+    // --- Setup ---
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+
+    // Input
+    const keys = new Set();
+    addEventListener("keydown", e => keys.add(e.key));
+    addEventListener("keyup",   e => keys.delete(e.key));
+
+    // Helpers
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const rand = (a, b) => Math.random() * (b - a) + a;
+
+    // Game state
+    let state;
+    function reset() {
+      state = {
+        t: 0,
+        score: 0,
+        gameOver: false,
+        player: { x: W/2, y: H-80, w: 40, h: 40, vx:0, speed: 320 },
+        enemies: [],
+        spawnTimer: 0,
+        spawnEvery: 0.6, // seconds
+        enemySpeed: 150,
+      };
+      updateScore();
+    }
+
+    function updateScore() {
+      document.getElementById("score").textContent = "Score: " + Math.floor(state.score);
+    }
+
+    // Entities
+    function spawnEnemy() {
+      const w = rand(40, 90);
+      const x = rand(0, W - w);
+      state.enemies.push({ x, y: -60, w, h: 20, vy: state.enemySpeed + state.t * 4 });
+    }
+
+    function rectsOverlap(a, b) {
+      return !(a.x+a.w < b.x || b.x+b.w < a.x || a.y+a.h < b.y || b.y+b.h < a.y);
+    }
+
+    // --- Main loop ---
+    let last = performance.now();
+    function loop(now) {
+      const dt = Math.min(0.033, (now - last) / 1000); // clamp dt for stability
+      last = now;
+
+      update(dt);
+      render();
+
+      requestAnimationFrame(loop);
+    }
+
+    function update(dt) {
+      if (state.gameOver) {
+        if (keys.has("r") || keys.has("R")) reset();
+        return;
+      }
+
+      state.t += dt;
+      state.score += dt * 10;
+      updateScore();
+
+      // Player
+      const p = state.player;
+      p.vx = 0;
+      if (keys.has("ArrowLeft") || keys.has("a") || keys.has("A")) p.vx -= p.speed;
+      if (keys.has("ArrowRight")|| keys.has("d") || keys.has("D")) p.vx += p.speed;
+      p.x += p.vx * dt;
+      p.x = clamp(p.x, 0, W - p.w);
+
+      // Spawn enemies (faster over time)
+      state.spawnTimer -= dt;
+      if (state.spawnTimer <= 0) {
+        spawnEnemy();
+        state.spawnEvery = Math.max(0.18, state.spawnEvery * 0.985);
+        state.spawnTimer = state.spawnEvery;
+      }
+
+      // Move enemies
+      for (const e of state.enemies) {
+        e.y += e.vy * dt;
+      }
+
+      // Remove off-screen
+      state.enemies = state.enemies.filter(e => e.y < H + 40);
+
+      // Collision
+      for (const e of state.enemies) {
+        if (rectsOverlap(p, e)) {
+          state.gameOver = true;
+          break;
+        }
+      }
+    }
+
+    function render() {
+      // Clear
+      ctx.clearRect(0, 0, W, H);
+
+      // Background stars
+      ctx.globalAlpha = 0.25;
+      for (let i=0;i<60;i++){
+        ctx.fillRect((i*79)%W, ((i*97)+Math.floor(state.t*60*i))%H, 2, 2);
+      }
+      ctx.globalAlpha = 1;
+
+      // Player
+      const p = state.player;
+      ctx.fillStyle = "#5eead4";
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+
+      // Enemies
+      ctx.fillStyle = "#ef4444";
+      for (const e of state.enemies) {
+        ctx.fillRect(e.x, e.y, e.w, e.h);
+      }
+
+      // UI overlays
+      if (state.gameOver) {
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "#fff";
+        ctx.textAlign = "center";
+        ctx.font = "bold 36px system-ui, Arial";
+        ctx.fillText("Game Over", W/2, H/2 - 10);
+        ctx.font = "16px system-ui, Arial";
+        ctx.fillText("Press R to restart", W/2, H/2 + 24);
+      }
+    }
+
+    // Restart button
+    document.getElementById("restart").addEventListener("click", reset);
+
+    // Boot
+    reset();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
+
