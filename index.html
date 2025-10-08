@@ -1,0 +1,473 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Runner — Space Jump, Duck Down, Coins + Sound</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin:0; height:100%; background:#0b0f13; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  .wrap { display:grid; place-items:center; height:100%; }
+  #ui { position:fixed; top:10px; left:50%; transform:translateX(-50%); display:flex; gap:8px; align-items:center; user-select:none; z-index:2 }
+  #score, #hiscore, #coins { font-weight:700; font-variant-numeric: tabular-nums; padding:6px 10px; background:#0d0f13; border:1px solid #20252f; border-radius:10px; color:#e9eef6 }
+  .btn, .chk { padding:6px 10px; border:1px solid #20252f; border-radius:10px; background:#0d0f13; color:#e9eef6; cursor:pointer; }
+  canvas { width:min(94vw, 960px); height:auto; max-height:84vh; background:#0b0f13; border:1px solid #20252f; border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,.25); touch-action:none; }
+  #hint { position:fixed; bottom:10px; left:50%; transform:translateX(-50%); color:#a8b4c7; font-size:12px; opacity:.8 }
+</style>
+</head>
+<body>
+  <div id="ui">
+    <span id="score">Score: 00000</span>
+    <span id="hiscore">HI: 00000</span>
+    <span id="coins">Coins: 0</span>
+    <button id="pause" class="btn">Pause (P)</button>
+    <label class="chk"><input id="mute" type="checkbox" /> Mute</label>
+  </div>
+  <div class="wrap">
+    <canvas id="game" width="960" height="300"></canvas>
+  </div>
+  <div id="hint">Jump: Space • Duck (hold): ↓ or tap/hold left side • Pause: P</div>
+
+<script>
+(() => {
+  // ---------- Canvas ----------
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+
+  // ---------- World / Physics ----------
+  const GROUND_Y = H - 54;
+  const GRAVITY = 2400;
+  const JUMP_VY = -820;
+  const START_SPEED = 360, MAX_SPEED = 820, ACCEL = 14;
+
+  // Feel
+  const COYOTE_TIME = 0.08;
+  const JUMP_BUFFER = 0.12;
+  const MAX_JUMP_HOLD = 0.20;
+  const STEP_FREQ = 8.5;
+
+  // ---------- Helpers ----------
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const rint = (a,b)=>Math.floor(Math.random()*(b-a+1))+a;
+  const fmt5 = n => String(Math.floor(n)).padStart(5,"0");
+  const loadHi = () => Number(localStorage.getItem("runner_hi_sound")||0);
+  const saveHi = v => localStorage.setItem("runner_hi_sound", String(Math.floor(v)));
+
+  // ---------- Sound ----------
+  const MUTE = document.getElementById("mute");
+  let audioCtx = null;
+  function beep(type='sine', freq=440, t=0.07, vol=0.08, decay=1.6) {
+    if (MUTE.checked) return;
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = type; o.frequency.value = freq;
+      o.connect(g); g.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      g.gain.value = vol;
+      g.gain.setValueAtTime(vol, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + t*decay);
+      o.start(now); o.stop(now + t*decay);
+    } catch { /* ignore */ }
+  }
+  const sfx = {
+    jump: ()=>beep('square', 520, 0.08, 0.09, 1.8),
+    land: ()=>beep('triangle', 170, 0.06, 0.08, 2.0),
+    coin: ()=>{ beep('sine', 980, 0.05, 0.08, 1.6); setTimeout(()=>beep('sine', 1260, 0.05, 0.07,1.5), 45); },
+    hit:  ()=>beep('sawtooth', 140, 0.18, 0.18, 2.4),
+  };
+
+  // ---------- State ----------
+  let state;
+  let lastTS = performance.now();
+
+  function makePlayer(){
+    return {
+      x: 110,
+      y: GROUND_Y - 48,
+      vy: 0,
+      w: 26, h: 48,
+      onGround: true, duck:false,
+      anim:0, coyote:0, jumpBuf:0, jumpHeld:-1
+    };
+  }
+
+  function makeCactus(x){
+    const v = [{w:22,h:42},{w:26,h:48},{w:32,h:54}][rint(0,2)];
+    return { x, y:GROUND_Y - v.h, w:v.w, h:v.h, type:'cactus' };
+  }
+
+  function makeCloud(x){ return { x, y:rint(24,140), w:rint(46,90), h:rint(18,34), s:rint(10,22) }; }
+
+  // Few coins: rare singles, static, cap 3
+  function makeCoin(x){
+    return { x, y: rint(GROUND_Y-130, GROUND_Y-110), w:16, h:18, type:'coin' };
+  }
+
+  // Minimal particle (tiny dust), pooled to avoid GC
+  const MAX_PARTICLES = 20;
+  const particles = new Array(MAX_PARTICLES).fill(null).map(()=>({x:0,y:0, vx:0,vy:0, r:0, ttl:0}));
+  let pHead = 0;
+  function spawnDust(x,y,hard=false,count=3){
+    for(let i=0;i<count;i++){
+      const p = particles[pHead]; pHead = (pHead+1)%MAX_PARTICLES;
+      p.x = x + rint(-2,2); p.y = y;
+      p.vx = (Math.random()*50+40)*(Math.random()<.5?-1:1);
+      p.vy = -(Math.random()*60+20);
+      p.r = hard ? rint(2,3) : rint(1,2);
+      p.ttl = hard ? 0.30 : 0.22;
+    }
+  }
+
+  // Small floating text for coin pickup
+  const popups = []; // {x,y,text,ttl}
+  function addPopup(x,y,text){ popups.push({x,y,text,ttl:0.7}); if(popups.length>8) popups.shift(); }
+
+  function reset(){
+    state = {
+      t:0, score:0, hiscore:loadHi(),
+      coins:0,
+      speed:START_SPEED,
+      player: makePlayer(),
+      obstacles: [],
+      clouds: [],
+      coinsArr: [],
+      nextSpawnX: W + 260,
+      gameOver:false, started:false, paused:false,
+    };
+    for(let i=0;i<5;i++) state.clouds.push(makeCloud(rint(0,W)));
+    updateHUD();
+  }
+
+  // ---------- Input ----------
+  const keys = new Set();
+  let touchDuck=false;
+
+  addEventListener("keydown", e=>{
+    // Controls: Space jump only, Down to duck, P pause
+    if(["Space","ArrowDown","KeyP"].includes(e.code)) e.preventDefault();
+    if(e.repeat) return;
+
+    if(!state.started && e.code==="Space"){ state.started=true; }
+    keys.add(e.code);
+    if(e.code==="KeyP") state.paused = !state.paused;
+    if(e.code==="Space") bufferJump(); // jump buffer only for Space
+  });
+  addEventListener("keyup", e=>{
+    keys.delete(e.code);
+    if (e.code==="Space") state.player.jumpHeld=-1;
+  });
+  function bufferJump(){ state.player.jumpBuf = JUMP_BUFFER; }
+
+  // Touch: left = duck (hold), right = jump
+  function pointerDown(ev){
+    if(!state.started){ state.started=true; return; }
+    if(state.gameOver){ reset(); return; }
+    const x = (ev.clientX ?? ev.touches?.[0]?.clientX ?? W/2);
+    const rect = canvas.getBoundingClientRect();
+    if (x - rect.left < rect.width/2) touchDuck=true; else bufferJump();
+  }
+  function pointerUp(){ touchDuck=false; state.player.jumpHeld=-1; }
+  canvas.addEventListener("pointerdown", pointerDown);
+  canvas.addEventListener("pointerup", pointerUp);
+  canvas.addEventListener("touchstart", pointerDown, {passive:false});
+  canvas.addEventListener("touchend", pointerUp);
+
+  document.getElementById("pause").addEventListener("click", ()=> state.paused=!state.paused);
+
+  // ---------- Spawns ----------
+  function ensureSpawns(){
+    // Obstacles
+    if(state.obstacles.length===0){
+      state.obstacles.push(makeCactus(W + rint(0,80)));
+      state.nextSpawnX = W + rint(360,700);
+    } else {
+      const last = state.obstacles.at(-1);
+      if (last.x < W - state.nextSpawnX){
+        state.obstacles.push(makeCactus(W + rint(0,40)));
+        const gapBase = clamp(720 - state.score*0.6, 360, 720);
+        state.nextSpawnX = rint(340, Math.floor(gapBase));
+      }
+    }
+    // Coins: very rare, singles, cap 3
+    if (state.coinsArr.length < 3 && Math.random() < 0.0025){
+      state.coinsArr.push(makeCoin(W + rint(40,140)));
+    }
+  }
+
+  // ---------- Update ----------
+  function update(dt){
+    if(!state.started || state.paused) return;
+    if(state.gameOver){
+      if(keys.has("Space")||keys.has("Enter")) reset();
+      return;
+    }
+
+    state.t += dt;
+    state.speed = clamp(state.speed + ACCEL*dt, START_SPEED, MAX_SPEED);
+    ensureSpawns();
+
+    // Clouds (lightweight)
+    for(const c of state.clouds) c.x -= c.s*dt;
+    state.clouds = state.clouds.filter(c => c.x+c.w>-20);
+    if(state.clouds.length<6 || state.clouds.at(-1).x < W-220) state.clouds.push(makeCloud(W + rint(80,160)));
+
+    // Obstacles
+    for(const o of state.obstacles){ o.x -= state.speed*dt; }
+    state.obstacles = state.obstacles.filter(o => o.x+o.w>-40);
+
+    // Coins
+    for(const c of state.coinsArr){ c.x -= state.speed*dt; }
+    state.coinsArr = state.coinsArr.filter(c => c.x + c.w > -20);
+
+    // Player control + physics
+    const p = state.player;
+    const wantDuck = (keys.has("ArrowDown") || touchDuck); // only Down for duck
+    p.duck = wantDuck && p.onGround;
+
+    // timers
+    if(!p.onGround) p.coyote = Math.max(0, p.coyote - dt);
+    p.jumpBuf = Math.max(0, p.jumpBuf - dt);
+
+    // Buffered jump (Space only)
+    if ((p.onGround || p.coyote>0) && p.jumpBuf>0){
+      p.vy = JUMP_VY; p.onGround=false; p.coyote=0; p.jumpBuf=0; p.jumpHeld=0;
+      sfx.jump();
+      spawnDust(p.x+8, GROUND_Y, false, 3); // minimal
+    }
+
+    // variable jump (hold Space)
+    const holding = keys.has("Space") && p.jumpHeld>=0;
+    if (p.jumpHeld>=0) p.jumpHeld += dt;
+    const boost = (holding && p.jumpHeld < MAX_JUMP_HOLD && p.vy < 0) ? 0.55 : 1.0;
+    p.vy += GRAVITY * boost * dt;
+    p.y  += p.vy * dt;
+
+    // Ground collision
+    const ph = p.duck ? 34 : 48; p.h = ph;
+    const gy = GROUND_Y - ph;
+    if (p.y >= gy){
+      if(!p.onGround && Math.abs(p.vy) > 320){
+        sfx.land();
+        spawnDust(p.x+10, GROUND_Y, true, 4); // minimal
+      }
+      p.y = gy; p.vy=0; p.onGround=true; p.coyote=COYOTE_TIME;
+    } else {
+      p.onGround=false;
+    }
+
+    // Run cycle
+    p.anim += dt*STEP_FREQ;
+
+    // Particles integrate (no allocation)
+    for(let i=0;i<MAX_PARTICLES;i++){
+      const q = particles[i]; if (q.ttl<=0) continue;
+      q.ttl -= dt; if(q.ttl<=0) continue;
+      q.x += q.vx*dt; q.y += q.vy*dt;
+      q.vy += 1100*dt;
+    }
+
+    // Score over time
+    state.score += dt*10;
+
+    // Collisions
+    const pr = {x:p.x, y:p.y, w:26, h:p.h};
+
+    // Coins: add progressive bonus + popup text
+    for(const c of state.coinsArr){
+      if(!(pr.x+pr.w<c.x || c.x+c.w<pr.x || pr.y+pr.h<c.y || c.y+c.h<pr.y)){
+        state.coins += 1;
+        const coinBonus = 10 + (state.coins - 1); // small math bonus
+        state.score += coinBonus;
+        addPopup(c.x, c.y-12, `+${coinBonus}`);
+        sfx.coin();
+        c.x = -9999; // remove
+        updateHUD();
+      }
+    }
+
+    // Cactus hit ends game
+    for(const o of state.obstacles){
+      if(!(pr.x+pr.w<o.x || o.x+o.w<pr.x || pr.y+pr.h<o.y || o.y+o.h<pr.y)){
+        sfx.hit();
+        state.gameOver = true;
+        break;
+      }
+    }
+
+    // High score
+    if (state.score > state.hiscore){ state.hiscore = state.score; saveHi(state.hiscore); }
+
+    // Update popups
+    for(let i=0;i<popups.length;i++){
+      popups[i].ttl -= dt;
+      popups[i].y -= 24*dt;
+    }
+    while(popups.length && popups[0].ttl<=0) popups.shift();
+
+    updateHUD();
+  }
+
+  // ---------- Render ----------
+  function cloud(x,y,w,h){
+    ctx.beginPath(); ctx.roundRect(x,y,w,h,12); ctx.fill();
+    ctx.roundRect(x+w*0.2, y-8, w*0.6, h, 12); ctx.fill();
+  }
+  function drawCactus(o){
+    ctx.fillStyle="#2eb872";
+    ctx.beginPath(); ctx.roundRect(o.x, o.y, o.w, o.h, 5); ctx.fill();
+    ctx.fillStyle="#1e7a4d";
+    ctx.fillRect(o.x+o.w*0.2, o.y+o.h*0.2, 2, o.h*0.6);
+    ctx.fillRect(o.x+o.w*0.6, o.y+o.h*0.25, 2, o.h*0.5);
+  }
+  function drawPerson(p){
+    const skin = "#f3e4d7";
+    const cloth = "#a7c3ff";
+    const dark  = "#0e1116";
+    const headR = 9, torsoH=22, torsoW=14, armL=16, legL=18;
+    const phase = (p.anim % 1);
+    const isDuck = p.duck && p.onGround;
+    const isAir = !p.onGround;
+
+    let torsoTilt = isDuck ? 0.22 : (isAir ? 0.05 : 0.1 * Math.sin(phase*2*Math.PI));
+    let headY = isDuck ? -torsoH+6 : -torsoH-2;
+    const runSwing = Math.sin(phase*2*Math.PI);
+    let armA1 = isDuck ? 0.8 : (isAir ? 0.2 :  0.8*runSwing);
+    let armA2 = isDuck ? 0.55: (isAir ? -0.2 : -0.8*runSwing);
+    let legA1 = isDuck ? 0.15: (isAir ? 0.35 : -0.9*runSwing);
+    let legA2 = isDuck ? -0.05:(isAir ? 0.10 :  0.9*runSwing);
+
+    // shadow
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = "#000";
+    ctx.beginPath(); ctx.ellipse(p.x+8, p.y+p.h+4, 16, 4, 0, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // hips origin
+    ctx.save();
+    ctx.translate(p.x+8, p.y+p.h-2);
+
+    // legs
+    ctx.strokeStyle = dark; ctx.lineWidth = 3; ctx.lineCap="round";
+    ctx.save(); ctx.rotate(legA1); line(0,0, 0, legL); ctx.restore();
+    ctx.save(); ctx.rotate(legA2); line(0,0, 0, legL); ctx.restore();
+
+    // torso
+    ctx.save();
+    ctx.rotate(-torsoTilt);
+    ctx.fillStyle = cloth;
+    roundRectCentered(0, -torsoH, torsoW, torsoH, 6, true, false);
+
+    // arms
+    ctx.translate(0, -torsoH+6);
+    ctx.save(); ctx.rotate(armA1); line(0,0, 0, armL); ctx.restore();
+    ctx.save(); ctx.rotate(armA2); line(0,0, 0, armL); ctx.restore();
+
+    // head
+    ctx.fillStyle = skin;
+    ctx.beginPath(); ctx.arc(0, headY, headR, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = dark; ctx.fillRect(-2, headY-2, 3, 3);
+
+    ctx.restore(); // torso
+    ctx.restore(); // hips
+
+    function line(x1,y1,x2,y2){ ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); }
+    function roundRectCentered(cx,cy,w,h,r,fill,stroke){
+      const x=cx-w/2, y=cy;
+      ctx.beginPath();
+      ctx.moveTo(x+r, y);
+      ctx.arcTo(x+w, y,   x+w, y+h, r);
+      ctx.arcTo(x+w, y+h, x,   y+h, r);
+      ctx.arcTo(x,   y+h, x,   y,   r);
+      ctx.arcTo(x,   y,   x+w, y,   r);
+      if(fill) ctx.fill(); if(stroke) ctx.stroke();
+    }
+  }
+
+  function render(){
+    // background
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,"#0b1220"); g.addColorStop(1,"#0a0d14");
+    ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+    // clouds
+    ctx.fillStyle="#a7b4c8"; ctx.globalAlpha=0.65;
+    for(const c of state.clouds) cloud(c.x, c.y, c.w, c.h);
+    ctx.globalAlpha=1;
+
+    // ground
+    ctx.strokeStyle="#2a3546"; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(0, GROUND_Y+1); ctx.lineTo(W, GROUND_Y+1); ctx.stroke();
+    ctx.fillStyle="#0e1622"; ctx.fillRect(0, GROUND_Y+2, W, H-(GROUND_Y+2));
+
+    // obstacles
+    for(const o of state.obstacles) drawCactus(o);
+
+    // coins (simple static)
+    for(const c of state.coinsArr){
+      ctx.save(); ctx.translate(c.x, c.y);
+      ctx.fillStyle = "#ffd66b";
+      ctx.beginPath(); ctx.ellipse(0,0,10,12,0,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle="#7f651c"; ctx.stroke();
+      ctx.restore();
+    }
+
+    // particles (few)
+    ctx.fillStyle = "#a0b3c7";
+    for(let i=0;i<MAX_PARTICLES;i++){
+      const q = particles[i]; if(q.ttl<=0) continue;
+      const alpha = q.ttl / 0.30;
+      ctx.globalAlpha = clamp(alpha,0,0.8);
+      ctx.beginPath(); ctx.arc(q.x, q.y, q.r, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // popups
+    for(const p of popups){
+      const a = clamp(p.ttl/0.7, 0, 1);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 14px system-ui, Arial";
+      ctx.textAlign = "center";
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.globalAlpha = 1;
+
+    // player
+    drawPerson(state.player);
+
+    // overlays
+    if(!state.started){ banner("Tap / Space to start"); }
+    else if(state.paused){ banner("Paused — P to resume"); }
+    else if(state.gameOver){ banner("Game Over — Space/Tap to restart"); }
+  }
+
+  function banner(text){
+    ctx.fillStyle="rgba(0,0,0,0.45)"; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle="#fff"; ctx.textAlign="center";
+    ctx.font="bold 22px system-ui, Arial"; ctx.fillText(text, W/2, H/2);
+    ctx.font="14px system-ui, Arial"; ctx.fillText("Jump: Space • Duck: ↓ (hold) • Pause: P", W/2, H/2+26);
+  }
+
+  function updateHUD(){
+    document.getElementById("score").textContent = "Score: " + fmt5(state.score);
+    document.getElementById("hiscore").textContent = "HI: " + fmt5(state.hiscore);
+    document.getElementById("coins").textContent = "Coins: " + state.coins;
+  }
+
+  // ---------- Main loop ----------
+  function loop(ts){
+    const dt = Math.min(0.033, (ts - lastTS)/1000); lastTS = ts;
+    update(dt); render();
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- Boot ----------
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
